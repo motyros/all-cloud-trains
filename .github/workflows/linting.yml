@@ -1,0 +1,34 @@
+name: Linting
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Sync workspace
+        # --all-packages is required to include extras from workspace members
+        # (backend's dev extra holds ruff itself). --locked fails on lockfile drift.
+        run: uv sync --all-packages --all-extras --locked --python 3.11
+
+      - name: Ruff check
+        # --no-sync skips uv run's implicit sync: the step above already installed
+        # every member and extra, and skipping it keeps each step from re-resolving.
+        run: uv run --no-sync ruff check backend/src backend/tests backend/scripts backend/migrations cli/src cli/tests tools
+
+      - name: Ruff format
+        run: uv run --no-sync ruff format --check backend/src backend/tests backend/scripts backend/migrations cli/src cli/tests tools

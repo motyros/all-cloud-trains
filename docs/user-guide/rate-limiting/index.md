@@ -1,0 +1,334 @@
+# Rate Limiting
+
+The boilerplate ships crudauth's rate limiter with per-tier, per-path limits backed by Redis. API
+routes are protected by default; authenticated requests key by user ID and anonymous requests by
+trusted-proxy-aware client IP.
+
+Two features carry this: `ratelimit` is the throttle itself, and `tier_limits` adds the per-tier rules
+and the routes that configure them. A project with neither throttles nothing and answers no `429`; one
+with `ratelimit` alone applies the default limit to every caller. See
+[Composable Features](../composable-features.md).
+
+!!! tip "Building a full SaaS?"
+    Rate limiting is part of the free foundation. **[FastroAI](https://fastro.ai)** bundles it with Stripe payments, entitlements, transactional email, a frontend, and AI agents - all wired together and production-ready. [Ship your SaaS faster →](https://fastro.ai)
+
+## What's Built In
+
+```text
+backend/src/infrastructure/auth/setup.py
+└── resolve_api_rate_limit()  crudauth per-request resolver
+
+backend/src/modules/rate_limit/
+├── models.py          RateLimit (tier_id, path, limit, period)
+├── routes.py          GET / GET-by-name / PATCH / DELETE on /api/v1/rate-limits/
+├── crud.py / service.py
+└── schemas.py
+```
+
+The configured crudauth backend is initialized with the auth singleton in the app's lifespan.
+
+## How a Request Flows Through It
+
+1. **The router-level crudauth dependency runs** for each API request.
+2. **`resolve_api_rate_limit`** looks up the user's tier and the row for the matched route template.
+3. **`api_rate_limit_key`** names the budget: the caller (user ID when signed in, client IP otherwise) plus the route template, so every route has its own counter.
+4. **crudauth's limiter** atomically increments the counter for the current window and returns `(count, is_limited)`. Windows are `period` seconds long and aligned to the clock, and each window's key expires on its own.
+5. **If `is_limited`**, raises a 429 with `Retry-After`. Otherwise the limiter attaches `X-RateLimit-Limit` and `X-RateLimit-Remaining` to the response. A request refused afterwards (a 401, a 404, a 422) still counts, and its response carries the headers too.
+
+A credential the throttle cannot resolve, such as a junk `X-API-Key` or an expired bearer token,
+is counted against the address rather than the caller: it spends the budget the same request would
+have spent carrying no credential at all. A caller whose credential does resolve keeps a budget of
+their own, so junk sent from their address never spends it.
+
+The key shape in Redis, ending in the start of the current window:
+
+```text
+crudauth:rl:ratelimit:api:user:{user_id}:{route_template}:{window_start}
+crudauth:rl:ratelimit:api:ip:{client_ip}:{route_template}:{window_start}
+```
+
+## Custom Enforcement
+
+Shipped API routes already use a router-level dependency. For another router, reuse the same
+crudauth API:
+
+```python
+from fastapi import APIRouter, Depends
+from src.infrastructure.auth.setup import auth
+from crudauth.ratelimit import KeyBy, RateLimit
+
+router = APIRouter()
+
+
+@router.post("/widgets/", dependencies=[Depends(auth.rate_limit("widgets", RateLimit(10, 60), key=KeyBy.USER_OR_IP))])
+async def create_widget(...): ...
+```
+
+Or apply it to every route in a router:
+
+```python
+router = APIRouter(dependencies=[Depends(auth.rate_limit("widgets", RateLimit(10, 60), key=KeyBy.USER_OR_IP))])
+```
+
+That's all that's required. The limiter is enabled with `RATE_LIMITER_ENABLED=true`.
+
+## Configuration
+
+```env
+# Master toggle for the API limits (the login lockout runs either way)
+RATE_LIMITER_ENABLED=true
+
+# Where counters live: redis (default), database or memory. Memory is per process, so it
+# only holds for a single worker. Database keeps them in this project's own tables, shared
+# by every worker. The memcached limiter was removed; that value fails at startup.
+RATE_LIMITER_BACKEND=redis
+
+# Defaults applied when the user has no tier or no matching rate-limit row
+DEFAULT_RATE_LIMIT_LIMIT=100
+DEFAULT_RATE_LIMIT_PERIOD=60          # seconds — 100/60s by default
+
+# Redis backend
+RATE_LIMITER_REDIS_HOST=redis         # use "localhost" without Docker
+RATE_LIMITER_REDIS_PORT=6379
+RATE_LIMITER_REDIS_DB=1               # rate-limiter DB (cache DB 0, sessions DB 2, taskiq DB 3)
+RATE_LIMITER_REDIS_PASSWORD=
+RATE_LIMITER_REDIS_CONNECT_TIMEOUT=5
+RATE_LIMITER_REDIS_POOL_SIZE=10
+```
+
+When `RATE_LIMITER_ENABLED=false`, the router-level dependency is a no-op. This is useful in tests
+and for isolating performance issues. The login lockout still counts on `RATE_LIMITER_BACKEND`, and
+fails closed: with that backend unreachable, logins are refused rather than left unthrottled.
+
+`RATE_LIMITER_BACKEND=database` counts in `crudauth_counters`, a table of this project's own
+database, so several workers share one count with no Redis to run. It matters most for the login
+lockout: with `memory`, each of N workers counts failures separately and an attacker gets N times
+the attempts. Expired counters are deleted as the store writes (about as many rows as the writes
+that created them), so nothing accumulates. Selecting it adds that table and `crudauth_store` to the
+schema — one migration, or `CREATE_TABLES_ON_STARTUP` in development.
+
+Every rate-limited request is a database write, not only a login: the API limits count there too.
+Under heavy API traffic prefer Redis, and keep `database` for the deployments whose reason to exist
+is running without one.
+
+## User-Tier vs IP-Based Limits
+
+`api_rate_limit_key` uses the request principal when authentication is present and falls back to
+the client IP using `TRUSTED_PROXY_HOPS`, adding the route template either way. The resolver checks that
+template against the user's tier and falls back to the configured default.
+
+## Path Matching
+
+Rate-limit rows are matched against the **route template** the request matched, as the router
+declares it, including the API prefix. The samples below use the default `/api`; a project that
+set `API_PREFIX=/service` stores its rows as `/service/v1/...`:
+
+```text
+/api/v1/users/               # the listing route, trailing slash included
+/api/v1/users/{username}     # every user lookup, sharing one counter per caller
+/api/v1/items/{id:int}       # a converter, as the route declares it
+/api/v1/files/{path:path}    # a wildcard segment
+```
+
+The trailing slash is part of the template: the listing route is declared as `/api/v1/users/`, so a
+row for `/api/v1/users` never matches it. Read the templates off the app rather than guessing:
+
+```python
+from fastapi.routing import APIRoute
+from src.interfaces.main import app
+
+print(sorted(route.path for route in app.routes if isinstance(route, APIRoute)))
+```
+
+A row that names a concrete path such as `/api/v1/users/42` never matches, because the request
+resolves to `/api/v1/users/{username}`. One counter per caller per route also means a caller can't
+spend another route's budget by hitting one hot resource.
+
+The `path` column accepts a leading slash and segments of literal text, one `{name}` placeholder
+with an optional Starlette converter (`str`, `path`, `int`, `float`, `uuid`), or literal text around
+one placeholder (`/items/{id}.json`, `/v{version}/items`). Unbalanced braces, an unknown converter,
+two placeholders in one segment, and anything with trailing whitespace or a newline are refused.
+
+## Managing Rate-Limit Rules
+
+The `RateLimit` model:
+
+```python
+class RateLimit(Base, TimestampMixin, SoftDeleteMixin):
+    __tablename__ = "rate_limits"
+
+    id: int
+    tier_id: int        # FK to tiers.id
+    name: str           # unique — used as the URL path on /rate-limits/{name}
+    path: str           # route template the rule applies to
+    limit: int          # max requests per period
+    period: int         # seconds
+
+    __table_args__ = (
+        Index(
+            "uq_rate_limits_tier_path",
+            "tier_id",
+            "path",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+    )
+```
+
+`limit` and `period` are `Integer` columns, so both must be within `1..2147483647`: a create or a
+`PATCH` outside that answers `422`. A row seeded through SQL or `crud_rate_limits` stays inside the
+same range, since Postgres refuses the statement otherwise.
+
+A tier limits a path with one rule. The index refuses a second row for the same `tier_id` and
+`path`, because the limit a caller got was whichever row the lookup read first: two rows saying
+`10` and `1000` for `/api/v1/users/` made the limit a toss-up. A `PATCH` that moves a rule onto a
+path the tier already limits answers `409`, and so does `RateLimitService.create`. Soft-deleted
+rows are outside the index, so a path whose rule was deleted is free to configure again.
+
+A rule names its tier, and the tier is read before the row is written: one deleted in between
+leaves the foreign key to refuse the rule, which answers `404` for the tier rather than a
+conflict with another rule. Which constraint refused a row is read off the driver's own error
+(`modules/common/collisions.py`), and out of the quoted name in the message only where the
+driver gives none.
+
+### What the API exposes
+
+| Method | Path                         | Auth        | Notes                                    |
+|--------|------------------------------|-------------|------------------------------------------|
+| GET    | `/api/v1/rate-limits/`       | Superuser   | Paginated list of all rate-limit rules   |
+| GET    | `/api/v1/rate-limits/{name}` | Superuser   | Get a rule by name                       |
+| PATCH  | `/api/v1/rate-limits/{name}` | Superuser   | Update an existing rule                  |
+| DELETE | `/api/v1/rate-limits/{name}` | Superuser   | Delete a rule                            |
+
+There's **no POST endpoint** for creating rate-limit rules. To seed initial rules, you have three
+options. Whichever you use, a seeded `path` is the route template with the API prefix in it,
+exactly as [Path Matching](#path-matching) describes: the rows below are for the default
+`API_PREFIX=/api`, and a project that moved the API seeds `/service/v1/widgets/` instead.
+
+### Option 1: SQL / Migration
+
+Add an Alembic migration that inserts the rows:
+
+```python
+# alembic/versions/xxxx_seed_rate_limits.py
+def upgrade():
+    op.execute("""
+        INSERT INTO rate_limits (tier_id, name, path, "limit", period, created_at)
+        VALUES
+            (1, 'free_widgets_create', '/api/v1/widgets/', 10, 60, NOW()),
+            (2, 'pro_widgets_create',  '/api/v1/widgets/', 100, 60, NOW())
+    """)
+```
+
+### Option 2: Custom Seed Script
+
+Add a one-off in `backend/scripts/`:
+
+```python
+# backend/scripts/setup_rate_limits.py
+import asyncio
+
+from src.infrastructure.database.session import local_session
+from src.modules.rate_limit.crud import crud_rate_limits
+
+
+async def main():
+    async with local_session() as db:
+        await crud_rate_limits.create(db=db, object={
+            "tier_id": 1, "name": "free_widgets_create",
+            "path": "/api/v1/widgets/", "limit": 10, "period": 60,
+        })
+        await db.commit()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run with `uv run --no-sync python -m scripts.setup_rate_limits` (from `backend/`).
+
+A row whose `path` leaves the prefix out, or spells a concrete path such as `/api/v1/widgets/42`,
+is stored and then never matches anything. Read the templates off the app, as above, rather than
+typing them by hand. A second row for a tier and path that already has a rule is refused by
+`uq_rate_limits_tier_path`, whichever of the three you use.
+
+### Option 3: Add a SQLAdmin View
+
+Mirror `UserAdmin` and `TierAdmin` to add a `RateLimitAdmin` view — see [Admin Panel → Adding Models](../admin-panel/adding-models.md). This gives you a UI for creating, editing, and deleting rules.
+
+## Response Headers
+
+Every response to a counted request carries these, errors included:
+
+| Header                  | Meaning                                          |
+|-------------------------|--------------------------------------------------|
+| `X-RateLimit-Limit`     | The configured limit for this caller × path      |
+| `X-RateLimit-Remaining` | How many requests are left in the current window |
+
+A 429 also carries `Retry-After`, the seconds until the window resets. A request refused after
+the limiter counted it - a 401 from authentication, a 404, a 422 - still reports the budget it
+spent, through crudauth's `RateLimitHeadersMiddleware`, which the app factory installs.
+
+A per-action budget - the five password checks an hour an account gets for changing its password or
+its address - reports itself per route. On `POST /api/v1/auth/change-password`, crudauth's own guard
+counts the request, and every response carries that budget: a wrong password answers `401` with
+`X-RateLimit-Limit: 5` and the checks left in the window. On the email change, `PATCH
+/api/v1/users/{username}`, the budget is counted beside the path's allowance: the `200` and the `403`
+for a wrong password report the path's limit, and only the `429` reports `5`, `0` and `Retry-After`.
+
+These are standard-ish (formatted like the GitHub / Stripe convention, not RFC 6585). Frontends can read them to surface graceful "you're approaching your limit" UI.
+
+## Production Considerations
+
+### Pool sizing
+
+`RATE_LIMITER_REDIS_POOL_SIZE=10` is enough for typical workloads. If you're seeing `redis.exceptions.ConnectionError` under load, it usually means pool exhaustion — raise the pool size or check upstream connection-leak issues first.
+
+### Backend errors
+
+crudauth's window checks fail open on a Redis outage — requests pass through unrate-limited rather
+than turning a cache blip into 429s for everyone. The login lockout is the exception: it fails
+closed, so a locked-out account can't slip through while Redis is down.
+
+### Window behavior
+
+The implementation uses a fixed-window counter, with windows aligned to the clock. At the boundary between windows, a user can technically make `2 × limit` requests in a short span. For most use cases this is fine; if you need stricter sliding-window semantics, build that on top of the limiter yourself.
+
+### Anonymous-user limits
+
+IP-based rate limits are easy to bypass with NAT / proxies / IPv6 rotation. They're a speed bump, not security. If you're trying to prevent abuse rather than control fair use, you need authentication, captchas, or upstream firewall rules — not just rate limits.
+
+## Troubleshooting
+
+### "My limit is not matching"
+
+- Confirm `RATE_LIMITER_ENABLED=true`
+- Confirm the auth singleton initialized cleanly at startup
+- Confirm the `path` column on the rule is the route template, not a concrete path, including `/api/v1`
+
+### "All requests look anonymous even though users are logged in"
+
+The limiter keys on the resolved principal for authenticated requests. If users appear anonymous,
+the session cookie isn't reaching the app — check `SESSION_BACKEND`, `SESSION_REDIS_DB` and any
+reverse proxy that strips cookies.
+
+### "The limiter can't reach Redis"
+
+Window checks fail open, so requests keep flowing while Redis is down (the login lockout fails
+closed). Fix the Redis connection, or take the limiter out of the path entirely with
+`RATE_LIMITER_ENABLED=false`.
+
+## Key Files
+
+| Component             | Location                                                  |
+|-----------------------|-----------------------------------------------------------|
+| Resolver + dependency | `backend/src/infrastructure/auth/setup.py`                |
+| RateLimit model       | `backend/src/modules/rate_limit/models.py`                |
+| Rate-limit routes     | `backend/src/modules/rate_limit/routes.py`                |
+| Settings              | `backend/src/infrastructure/config/settings.py` (`RateLimiterSettings`) |
+
+## Next Steps
+
+- **[Tiers](../authentication/permissions.md#tier-based-authorization)** — Setting up user tiers
+- **[Admin Panel → Adding Models](../admin-panel/adding-models.md)** — Adding a `RateLimitAdmin` view
+- **[Caching → Cache Strategies](../caching/cache-strategies.md)** — Patterns that share the same Redis-as-state mindset

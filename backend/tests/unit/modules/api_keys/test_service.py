@@ -1,0 +1,939 @@
+"""Tests for API key management service."""
+
+import asyncio
+import base64
+import hashlib
+import logging
+import secrets
+import threading
+from datetime import UTC, datetime, timedelta
+from typing import Any, NoReturn
+from unittest.mock import patch
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+import src.modules.api_keys.service as service_module
+from src.modules.api_keys.crud import crud_api_keys
+from src.modules.api_keys.models import APIKey, KeyUsage
+from src.modules.api_keys.schemas import (
+    APIKeyCreate,
+    APIKeyCreateInternal,
+    APIKeyUpdate,
+    KeyUsageCreate,
+)
+from src.modules.api_keys.service import APIKeyService
+from src.modules.common.exceptions import PermissionDeniedError, ResourceNotFoundError, ValidationError
+
+
+def scrypt_hash(api_key: str, n: int = 2**14, r: int = 8, p: int = 1) -> str:
+    """The salted scrypt hash an older version of the service wrote for ``api_key``."""
+    salt = secrets.token_bytes(16)
+    derived = hashlib.scrypt(api_key.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
+    encoded = (base64.b64encode(value).decode("ascii") for value in (salt, derived))
+
+    return "$".join(["scrypt", str(n), str(r), str(p), *encoded])
+
+
+def _no_scrypt(*args: Any, **kwargs: Any) -> NoReturn:
+    """A stand-in for ``hashlib.scrypt`` that fails the test if a call reaches it."""
+    raise AssertionError("scrypt was called")
+
+
+HELD = frozenset({"user.read", "user.update"})
+"""What the account creating a scoped key holds; a key's scope may name no more."""
+
+
+@pytest.fixture
+def api_key_service():
+    """Create API key service instance."""
+    return APIKeyService()
+
+
+@pytest_asyncio.fixture
+async def test_api_key(api_key_service, db_session: AsyncSession, test_user: dict):
+    """Create a test API key."""
+    key_data = APIKeyCreate(
+        name="Test API Key", permissions=["user.read", "user.update"], usage_limits={"requests_per_day": 1000}
+    )
+
+    response = await api_key_service.create_api_key(user_id=test_user["id"], key_data=key_data, db=db_session, held=HELD)
+
+    return response
+
+
+@pytest.mark.asyncio
+async def test_create_api_key(api_key_service, db_session: AsyncSession, test_user: dict):
+    """Test creating a new API key."""
+    key_data = APIKeyCreate(name="Test Key", permissions=["user.read", "user.update"], usage_limits={"requests_per_day": 1000})
+
+    response = await api_key_service.create_api_key(user_id=test_user["id"], key_data=key_data, db=db_session, held=HELD)
+
+    assert response["name"] == "Test Key"
+    assert response["user_id"] == test_user["id"]
+    assert response["is_active"] is True
+    assert response["api_key"].startswith("fai_")
+    assert len(response["api_key"]) > 20  # Should be long enough
+    assert response["key_prefix"] is not None
+    assert len(response["key_prefix"]) == 8
+
+
+@pytest.mark.asyncio
+async def test_api_key_generation_unique(api_key_service):
+    """Test that API key generation produces unique keys."""
+    key1, prefix1, hash1 = api_key_service._generate_api_key()
+    key2, prefix2, hash2 = api_key_service._generate_api_key()
+
+    assert key1 != key2
+    assert prefix1 != prefix2
+    assert hash1 != hash2
+    assert key1.startswith("fai_")
+    assert key2.startswith("fai_")
+
+
+@pytest.mark.asyncio
+async def test_get_user_api_keys(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test getting user's API keys."""
+    result = await api_key_service.get_user_api_keys(user_id=test_user["id"], db=db_session)
+    keys = result.get("data", []) if isinstance(result, dict) else []
+
+    assert len(keys) >= 1
+    key = keys[0]
+    assert key["name"] == "Test API Key"
+    assert key["user_id"] == test_user["id"]
+    assert key["is_active"] is True
+    # API key should not be included in read response
+    assert "api_key" not in key
+
+
+@pytest.mark.asyncio
+async def test_get_user_api_keys_active_only(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test getting only active API keys."""
+    # Deactivate the test key
+    await api_key_service.delete_api_key(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+
+    # Should return no active keys
+    active_result = await api_key_service.get_user_api_keys(user_id=test_user["id"], db=db_session, active_only=True)
+    active_keys = active_result.get("data", []) if isinstance(active_result, dict) else []
+
+    # Should return all keys including inactive
+    all_result = await api_key_service.get_user_api_keys(user_id=test_user["id"], db=db_session, active_only=False)
+    all_keys = all_result.get("data", []) if isinstance(all_result, dict) else []
+
+    assert len(active_keys) == 0
+    assert len(all_keys) >= 1
+
+
+@pytest.mark.asyncio
+async def test_get_api_key_success(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test getting a specific API key."""
+    key = await api_key_service.get_api_key(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+
+    assert key["id"] == test_api_key["id"]
+    assert key["name"] == "Test API Key"
+    assert key["user_id"] == test_user["id"]
+
+
+@pytest.mark.asyncio
+async def test_get_api_key_not_found(api_key_service, db_session: AsyncSession, test_user: dict):
+    """Test getting non-existent API key."""
+    with pytest.raises(ResourceNotFoundError):
+        await api_key_service.get_api_key(key_id=99999, user_id=test_user["id"], db=db_session)
+
+
+@pytest.mark.asyncio
+async def test_get_api_key_permission_denied(
+    api_key_service, db_session: AsyncSession, test_user: dict, test_user_2: dict, test_api_key
+):
+    """Test getting API key owned by different user."""
+    with pytest.raises(PermissionDeniedError):
+        await api_key_service.get_api_key(key_id=test_api_key["id"], user_id=test_user_2["id"], db=db_session)
+
+
+@pytest.mark.asyncio
+async def test_update_api_key(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test updating an API key."""
+    update_data = APIKeyUpdate(name="Updated Key Name")
+
+    updated_key = await api_key_service.update_api_key(
+        key_id=test_api_key["id"], user_id=test_user["id"], update_data=update_data, db=db_session
+    )
+
+    assert updated_key["name"] == "Updated Key Name"
+    assert updated_key["id"] == test_api_key["id"]
+
+
+@pytest.mark.asyncio
+async def test_delete_api_key(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test deleting (deactivating) an API key."""
+    await api_key_service.delete_api_key(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+
+    # Key should still exist but be inactive
+    key = await api_key_service.get_api_key(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+
+    assert key["is_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_scope_beyond_what_the_caller_holds_is_refused(api_key_service, db_session: AsyncSession, test_user: dict):
+    """A key is a delegate, so it can carry no permission its creator lacks."""
+    key_data = APIKeyCreate(name="Too Wide", permissions=["user.read", "user.update"])
+
+    with pytest.raises(PermissionDeniedError, match="user.update"):
+        await api_key_service.create_api_key(
+            user_id=test_user["id"], key_data=key_data, db=db_session, held=frozenset({"user.read"})
+        )
+
+    stored = await api_key_service.get_user_api_keys(user_id=test_user["id"], db=db_session)
+    assert [key["name"] for key in stored["data"]] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unscoped_key_needs_nothing(api_key_service, db_session: AsyncSession, test_user: dict):
+    """An account that holds no permission can still mint a key for identity alone."""
+    created = await api_key_service.create_api_key(
+        user_id=test_user["id"], key_data=APIKeyCreate(name="Identity"), db=db_session, held=frozenset()
+    )
+
+    assert created["permissions"] == []
+
+
+@pytest.mark.asyncio
+async def test_widening_a_scope_on_an_update_is_refused(
+    api_key_service, db_session: AsyncSession, test_user: dict, test_api_key
+):
+    with pytest.raises(PermissionDeniedError, match="user.delete"):
+        await api_key_service.update_api_key(
+            key_id=test_api_key["id"],
+            user_id=test_user["id"],
+            update_data=APIKeyUpdate(permissions=["user.delete"]),
+            db=db_session,
+            held=HELD,
+        )
+
+    unchanged = await api_key_service.get_api_key(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+    assert unchanged["permissions"] == ["user.read", "user.update"]
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_success(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """A live key reports its owner and the permission names it carries."""
+    validation = await api_key_service.validate_api_key(api_key=test_api_key["api_key"], db=db_session)
+
+    assert validation.is_valid is True
+    assert validation.api_key_id == test_api_key["id"]
+    assert validation.user_id == test_user["id"]
+    assert validation.permissions == ["user.read", "user.update"]
+    assert validation.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_invalid(api_key_service, db_session: AsyncSession):
+    """Test validation with invalid API key."""
+    validation = await api_key_service.validate_api_key(api_key="fai_invalid_key_12345", db=db_session)
+
+    assert validation.is_valid is False
+    assert "Invalid API key" in validation.error_message
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_inactive(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test validation with inactive API key."""
+    # Deactivate the key
+    await api_key_service.delete_api_key(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+
+    validation = await api_key_service.validate_api_key(api_key=test_api_key["api_key"], db=db_session)
+
+    assert validation.is_valid is False
+    assert "inactive" in validation.error_message
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_expired(api_key_service, db_session: AsyncSession, test_user: dict):
+    """Test validation with expired API key."""
+    # Create key with past expiration
+
+    key_data = APIKeyCreate(
+        name="Expired Key",
+        expires_at=datetime.now(UTC) - timedelta(days=1),  # Already expired
+    )
+
+    expired_key = await api_key_service.create_api_key(user_id=test_user["id"], key_data=key_data, db=db_session)
+
+    validation = await api_key_service.validate_api_key(api_key=expired_key["api_key"], db=db_session)
+
+    assert validation.is_valid is False
+    assert "expired" in validation.error_message
+
+
+@pytest.mark.asyncio
+async def test_record_usage(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test recording API key usage."""
+    usage_data = KeyUsageCreate(
+        api_key_id=test_api_key["id"],
+        user_id=test_user["id"],
+        endpoint="/api/v1/conversations",
+        method="POST",
+        status_code=201,
+        response_time_ms=150,
+        tokens_used=25,
+        cost_microcents=5000,  # $0.05
+        user_agent="test-client/1.0",
+    )
+
+    usage_record = await api_key_service.record_usage(
+        api_key_id=test_api_key["id"], user_id=test_user["id"], usage_data=usage_data, db=db_session
+    )
+
+    assert usage_record["api_key_id"] == test_api_key["id"]
+    assert usage_record["user_id"] == test_user["id"]
+    assert usage_record["endpoint"] == "/api/v1/conversations"
+    assert usage_record["status_code"] == 201
+    assert usage_record["tokens_used"] == 25
+    assert usage_record["cost_microcents"] == 5000
+
+
+@pytest.mark.asyncio
+async def test_get_key_usage(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test getting API key usage history."""
+    # Record some usage
+    usage_data = KeyUsageCreate(
+        api_key_id=test_api_key["id"],
+        user_id=test_user["id"],
+        endpoint="/api/v1/test",
+        method="GET",
+        status_code=200,
+        response_time_ms=100,
+    )
+
+    await api_key_service.record_usage(
+        api_key_id=test_api_key["id"], user_id=test_user["id"], usage_data=usage_data, db=db_session
+    )
+
+    result = await api_key_service.get_key_usage(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+    usage_history = result.get("data", []) if isinstance(result, dict) else []
+
+    assert len(usage_history) >= 1
+    usage = usage_history[0]
+    assert usage["api_key_id"] == test_api_key["id"]
+    assert usage["endpoint"] == "/api/v1/test"
+
+
+@pytest.mark.asyncio
+async def test_get_usage_analytics(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test getting usage analytics for API key."""
+    # Record multiple usage entries
+    endpoints = ["/api/v1/test1", "/api/v1/test2", "/api/v1/test1"]
+    status_codes = [200, 201, 500]
+
+    for i, endpoint in enumerate(endpoints):
+        usage_data = KeyUsageCreate(
+            api_key_id=test_api_key["id"],
+            user_id=test_user["id"],
+            endpoint=endpoint,
+            method="GET",
+            status_code=status_codes[i],
+            response_time_ms=100 + i * 50,
+            tokens_used=10 + i * 5,
+            cost_microcents=1000 * (i + 1),
+        )
+
+        await api_key_service.record_usage(
+            api_key_id=test_api_key["id"], user_id=test_user["id"], usage_data=usage_data, db=db_session
+        )
+
+    analytics = await api_key_service.get_usage_analytics(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+
+    assert analytics["api_key_id"] == test_api_key["id"]
+    assert analytics["total_requests"] == 3
+    assert analytics["successful_requests"] == 2  # 200, 201
+    assert analytics["failed_requests"] == 1  # 500
+    assert analytics["total_tokens"] == 10 + 15 + 20  # 45
+    assert analytics["total_cost_microcents"] == 1000 + 2000 + 3000  # 6000
+    assert analytics["average_response_time_ms"] == (100 + 150 + 200) / 3
+
+    # Check most used endpoints
+    assert len(analytics["most_used_endpoints"]) >= 1
+    most_used = analytics["most_used_endpoints"][0]
+    assert most_used["endpoint"] == "/api/v1/test1"
+    assert most_used["count"] == 2
+
+    # Check error breakdown
+    assert "500" in analytics["error_breakdown"]
+    assert analytics["error_breakdown"]["500"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_user_summary(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test getting comprehensive user API key summary."""
+    # Record some usage
+    usage_data = KeyUsageCreate(
+        api_key_id=test_api_key["id"],
+        user_id=test_user["id"],
+        endpoint="/api/v1/test",
+        method="GET",
+        status_code=200,
+        cost_microcents=2500,
+    )
+
+    await api_key_service.record_usage(
+        api_key_id=test_api_key["id"], user_id=test_user["id"], usage_data=usage_data, db=db_session
+    )
+
+    summary = await api_key_service.get_user_summary(user_id=test_user["id"], db=db_session)
+
+    assert summary["user_id"] == test_user["id"]
+    assert summary["total_keys"] >= 1
+    assert summary["active_keys"] >= 1
+    assert summary["total_requests"] >= 1
+    assert summary["total_cost_microcents"] >= 2500
+    assert len(summary["keys"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_sum_user_usage_cost_not_page_capped(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Usage cost is summed in SQL, so it is not capped at a page size.
+
+    Regression lock for the old fetch-all + Python-loop sum, which silently
+    capped at FastCRUD's default 100 rows and under-reported cost for any user
+    with many usage records. We seed 150 usage rows of 1_000 microcents each;
+    the sum must report all 150_000, not the 100-row cap.
+    """
+    db_session.add_all(
+        [
+            KeyUsage(
+                api_key_id=test_api_key["id"],
+                user_id=test_user["id"],
+                endpoint="/api/v1/test",
+                method="GET",
+                status_code=200,
+                cost_microcents=1_000,
+            )
+            for _ in range(150)
+        ]
+    )
+    await db_session.commit()
+
+    total = await api_key_service.sum_user_usage_cost(user_id=test_user["id"], db=db_session)
+    summary = await api_key_service.get_user_summary(user_id=test_user["id"], db=db_session)
+
+    assert total == 150_000  # 150 * 1_000, proving no 100-row cap
+    assert summary["total_requests"] == 150
+    assert summary["total_cost_microcents"] == 150_000
+
+
+@pytest.mark.asyncio
+async def test_sum_user_usage_cost_scoped_to_user(
+    api_key_service, db_session: AsyncSession, test_user: dict, test_user_2: dict, test_api_key
+):
+    """The sum is scoped to the given user and never bleeds another user's cost.
+
+    Locks the ``WHERE user_id == user_id`` filter: with rows for two users, each
+    user's sum reflects only their own usage.
+    """
+    db_session.add_all(
+        [
+            KeyUsage(
+                api_key_id=test_api_key["id"],
+                user_id=test_user["id"],
+                endpoint="/api/v1/test",
+                method="GET",
+                status_code=200,
+                cost_microcents=1_000,
+            ),
+            KeyUsage(
+                api_key_id=test_api_key["id"],
+                user_id=test_user_2["id"],
+                endpoint="/api/v1/test",
+                method="GET",
+                status_code=200,
+                cost_microcents=9_999,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    assert await api_key_service.sum_user_usage_cost(user_id=test_user["id"], db=db_session) == 1_000
+    assert await api_key_service.sum_user_usage_cost(user_id=test_user_2["id"], db=db_session) == 9_999
+
+
+@pytest.mark.asyncio
+async def test_get_usage_analytics_not_page_capped(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Analytics are aggregated in SQL, so no metric is truncated at 100 rows.
+
+    Seeds 150 in-window rows (every third one a 500 on /api/v1/a, the rest 200s on
+    /api/v1/b) plus one row older than the window, which must be excluded.
+    """
+    rows = [
+        KeyUsage(
+            api_key_id=test_api_key["id"],
+            user_id=test_user["id"],
+            endpoint="/api/v1/a" if i % 3 == 0 else "/api/v1/b",
+            method="GET",
+            status_code=500 if i % 3 == 0 else 200,
+            tokens_used=2,
+            cost_microcents=1_000,
+            response_time_ms=100,
+        )
+        for i in range(150)
+    ]
+    stale = KeyUsage(
+        api_key_id=test_api_key["id"],
+        user_id=test_user["id"],
+        endpoint="/api/v1/stale",
+        method="GET",
+        status_code=404,
+        tokens_used=1_000,
+        cost_microcents=1_000_000,
+        response_time_ms=9_999,
+    )
+    stale.created_at = datetime.now(UTC) - timedelta(days=40)
+    db_session.add_all([*rows, stale])
+    await db_session.commit()
+
+    analytics = await api_key_service.get_usage_analytics(key_id=test_api_key["id"], user_id=test_user["id"], db=db_session)
+
+    assert analytics["total_requests"] == 150
+    assert analytics["successful_requests"] == 100
+    assert analytics["failed_requests"] == 50
+    assert analytics["total_tokens"] == 300
+    assert analytics["total_cost_microcents"] == 150_000
+    assert analytics["average_response_time_ms"] == 100.0
+    assert analytics["most_used_endpoints"] == [
+        {"endpoint": "/api/v1/b", "count": 100},
+        {"endpoint": "/api/v1/a", "count": 50},
+    ]
+    assert analytics["error_breakdown"] == {"500": 50}
+
+    usage_by_day = analytics["usage_by_day"]
+    assert sum(d["requests"] for d in usage_by_day) == 150
+    assert sum(d["successful_requests"] for d in usage_by_day) == 100
+    assert sum(d["failed_requests"] for d in usage_by_day) == 50
+    assert sum(d["tokens"] for d in usage_by_day) == 300
+    assert sum(d["cost_microcents"] for d in usage_by_day) == 150_000
+    assert all(len(d["date"]) == 10 for d in usage_by_day)  # YYYY-MM-DD
+
+
+@pytest.mark.asyncio
+async def test_user_summary_key_counts_not_page_capped(api_key_service, db_session: AsyncSession, test_user: dict):
+    """Key counts are SQL counts, so they are not capped at the key page size.
+
+    ``get_user_api_keys`` returns at most 50 keys, which used to be counted in
+    Python: a user with more keys saw exactly 50 for both totals. The ``keys``
+    list stays a page; the counts describe everything the user has.
+    """
+    for index in range(55):
+        await api_key_service.create_api_key(user_id=test_user["id"], key_data=APIKeyCreate(name=f"Key {index}"), db=db_session)
+    created = await api_key_service.get_user_api_keys(user_id=test_user["id"], db=db_session, active_only=False)
+    await api_key_service.delete_api_key(key_id=created["data"][0]["id"], user_id=test_user["id"], db=db_session)
+
+    summary = await api_key_service.get_user_summary(user_id=test_user["id"], db=db_session)
+
+    assert summary["total_keys"] == 55
+    assert summary["active_keys"] == 54
+    assert len(summary["keys"]) == 50
+
+
+def test_a_key_is_stored_as_a_digest_of_itself(api_key_service):
+    """A key carries 256 bits of randomness, so its hash needs no salt and no work factor."""
+    test_key = "fai_test_key_12345"
+    expected = hashlib.sha256(test_key.encode("utf-8")).hexdigest()
+
+    stored = api_key_service._hash_api_key(test_key)
+
+    assert stored == f"sha256${expected}"
+    assert api_key_service._hash_api_key(test_key) == stored
+
+
+def test_a_hash_an_older_version_stored_still_verifies(api_key_service):
+    """The scrypt form is only verified, never written, so a stored key keeps working."""
+    test_key = "fai_test_key_12345"
+    stored = scrypt_hash(test_key)
+
+    assert stored.startswith("scrypt$")
+    assert api_key_service._verify_api_key(test_key, stored)
+    assert not api_key_service._verify_api_key("fai_wrong_key", stored)
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_with_underscore_in_prefix(api_key_service, db_session: AsyncSession, test_user: dict):
+    """Regression: secrets.token_urlsafe alphabet includes `_`; prefix extraction must not split on it.
+
+    When the random 8-char prefix happens to contain `_`, a naive `split("_", 2)` returns the wrong
+    substring and the key_prefix lookup misses, breaking validation for the (rare) keys that draw
+    underscores.
+    """
+    api_key, prefix, key_hash = api_key_service._generate_api_key()
+    forced_prefix = "ab_cd_ef"
+    api_key = f"fai_{forced_prefix}_{api_key.split('_', 2)[2]}"
+    forced_hash = api_key_service._hash_api_key(api_key)
+
+    key_dict = {
+        "name": "underscore prefix",
+        "user_id": test_user["id"],
+        "key_hash": forced_hash,
+        "key_prefix": forced_prefix,
+        "permissions": [],
+        "usage_limits": {},
+        "owner_token_version": 0,
+    }
+    await crud_api_keys.create(db=db_session, object=APIKeyCreateInternal(**key_dict))
+
+    validation = await api_key_service.validate_api_key(api_key=api_key, db=db_session)
+
+    assert validation.is_valid is True
+
+
+@pytest.mark.asyncio
+async def test_usage_pagination(api_key_service, db_session: AsyncSession, test_user: dict, test_api_key):
+    """Test usage history pagination."""
+    # Create multiple usage records
+    for i in range(5):
+        usage_data = KeyUsageCreate(
+            api_key_id=test_api_key["id"], user_id=test_user["id"], endpoint=f"/api/v1/test{i}", method="GET", status_code=200
+        )
+
+        await api_key_service.record_usage(
+            api_key_id=test_api_key["id"], user_id=test_user["id"], usage_data=usage_data, db=db_session
+        )
+
+    # Test pagination
+    result = await api_key_service.get_key_usage(
+        key_id=test_api_key["id"], user_id=test_user["id"], db=db_session, limit=3, offset=0
+    )
+    usage_history = result.get("data", []) if isinstance(result, dict) else []
+
+    assert len(usage_history) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_key_cannot_be_reactivated(api_key_service, db_session, test_user: dict):
+    """Revocation is the answer to a leak, so it has to be one-way."""
+    created = await api_key_service.create_api_key(user_id=test_user["id"], key_data=APIKeyCreate(name="leaked"), db=db_session)
+    await api_key_service.update_api_key(
+        key_id=created["id"], user_id=test_user["id"], update_data=APIKeyUpdate(is_active=False), db=db_session
+    )
+
+    with pytest.raises(ValidationError, match="revoked"):
+        await api_key_service.update_api_key(
+            key_id=created["id"], user_id=test_user["id"], update_data=APIKeyUpdate(is_active=True), db=db_session
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_expiry_cannot_be_pushed_back(api_key_service, db_session, test_user: dict):
+    created = await api_key_service.create_api_key(
+        user_id=test_user["id"],
+        key_data=APIKeyCreate(name="short lived", expires_at=datetime.now(UTC) + timedelta(days=1)),
+        db=db_session,
+    )
+
+    with pytest.raises(ValidationError, match="expiry"):
+        await api_key_service.update_api_key(
+            key_id=created["id"],
+            user_id=test_user["id"],
+            update_data=APIKeyUpdate(expires_at=datetime.now(UTC) + timedelta(days=30)),
+            db=db_session,
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_expiry_cannot_be_cleared(api_key_service, db_session, test_user: dict):
+    created = await api_key_service.create_api_key(
+        user_id=test_user["id"],
+        key_data=APIKeyCreate(name="short lived", expires_at=datetime.now(UTC) + timedelta(days=1)),
+        db=db_session,
+    )
+
+    with pytest.raises(ValidationError, match="expiry"):
+        await api_key_service.update_api_key(
+            key_id=created["id"], user_id=test_user["id"], update_data=APIKeyUpdate(expires_at=None), db=db_session
+        )
+
+
+@pytest.mark.asyncio
+async def test_an_expiry_can_be_brought_forward(api_key_service, db_session, test_user: dict):
+    created = await api_key_service.create_api_key(
+        user_id=test_user["id"],
+        key_data=APIKeyCreate(name="short lived", expires_at=datetime.now(UTC) + timedelta(days=30)),
+        db=db_session,
+    )
+    sooner = datetime.now(UTC) + timedelta(days=1)
+
+    updated = await api_key_service.update_api_key(
+        key_id=created["id"], user_id=test_user["id"], update_data=APIKeyUpdate(expires_at=sooner), db=db_session
+    )
+
+    assert updated["expires_at"].replace(tzinfo=UTC) == sooner.replace(microsecond=sooner.microsecond)
+
+
+class TestAKeyStoredBeforeTheDigest:
+    """The scrypt fallback: what it authenticates, how the row moves over, and when it runs."""
+
+    @pytest_asyncio.fixture
+    async def legacy_key(self, api_key_service, db_session: AsyncSession, test_user: dict):
+        """A key whose row holds the scrypt hash an older version wrote."""
+        minted = await api_key_service.create_api_key(
+            user_id=test_user["id"], key_data=APIKeyCreate(name="Legacy Key"), db=db_session
+        )
+        await db_session.execute(
+            update(APIKey).where(APIKey.id == minted["id"]).values(key_hash=scrypt_hash(minted["api_key"]))
+        )
+        await db_session.commit()
+
+        return minted
+
+    @pytest.fixture
+    def the_rewrite_through_the_test_engine(self, monkeypatch, db_session: AsyncSession):
+        """The rewrite opens a session of its own, which outside a test is the app's engine."""
+        monkeypatch.setattr(
+            service_module,
+            "local_session",
+            async_sessionmaker(bind=db_session.bind, class_=AsyncSession, expire_on_commit=False),
+        )
+
+    async def _stored_hash(self, db_session: AsyncSession, key_id: int) -> str:
+        stored = await db_session.execute(select(APIKey.key_hash).where(APIKey.id == key_id))
+
+        return str(stored.scalar_one())
+
+    async def test_it_authenticates_and_its_row_moves_over(
+        self, api_key_service, db_session: AsyncSession, legacy_key: dict, the_rewrite_through_the_test_engine
+    ):
+        validation = await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+
+        assert validation.is_valid is True
+        assert validation.api_key_id == legacy_key["id"]
+        assert await self._stored_hash(db_session, legacy_key["id"]) == api_key_service._hash_api_key(legacy_key["api_key"])
+
+    async def test_the_fallback_verifies_off_the_event_loop(
+        self, api_key_service, db_session: AsyncSession, legacy_key: dict, the_rewrite_through_the_test_engine
+    ):
+        """scrypt is sized to take real time; on the loop thread it stalls every other request."""
+        threads: list[str] = []
+        real_verify = api_key_service._verify_api_key
+
+        def recording_verify(api_key: str, stored_hash: str) -> bool:
+            threads.append(threading.current_thread().name)
+            verified: bool = real_verify(api_key, stored_hash)
+
+            return verified
+
+        with patch.object(api_key_service, "_verify_api_key", recording_verify):
+            validation = await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+
+        assert validation.is_valid is True
+        assert threads
+        assert threading.main_thread().name not in threads
+
+    async def test_authenticating_commits_nothing_of_the_requests_own_session(
+        self,
+        api_key_service,
+        db_session: AsyncSession,
+        test_user: dict,
+        legacy_key: dict,
+        the_rewrite_through_the_test_engine,
+    ):
+        """The session a request authenticates through is the one its route writes through.
+
+        Committing it here would end a transaction the route never finished, and take with
+        it whatever the route had written so far. The rewrite still lands: it goes through
+        a session of its own, which a rollback of the route's cannot take back.
+        """
+        other = await api_key_service.create_api_key(
+            user_id=test_user["id"], key_data=APIKeyCreate(name="Another key"), db=db_session
+        )
+        await db_session.commit()
+        await db_session.execute(update(APIKey).where(APIKey.id == other["id"]).values(name="Half written"))
+
+        validation = await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+
+        await db_session.rollback()
+        assert validation.is_valid is True
+        assert await self._stored_hash(db_session, legacy_key["id"]) == api_key_service._hash_api_key(legacy_key["api_key"])
+        kept = await db_session.execute(select(APIKey.name).where(APIKey.id == other["id"]))
+        assert kept.scalar_one() == "Another key"
+
+    async def test_two_requests_racing_with_the_same_key_move_the_row_over_once(
+        self, api_key_service, db_session: AsyncSession, legacy_key: dict, the_rewrite_through_the_test_engine, caplog
+    ):
+        """Both verify before either writes, so the second finds a row that has moved on.
+
+        The barrier holds each verification in its worker thread until the other arrives,
+        which is the order two requests carrying one legacy key race in.
+        """
+        both_verifying = threading.Barrier(2, timeout=5)
+        real_verify = api_key_service._verify_api_key
+
+        def verify_together(api_key: str, stored_hash: str) -> bool:
+            verified: bool = real_verify(api_key, stored_hash)
+            both_verifying.wait()
+
+            return verified
+
+        sessions = async_sessionmaker(bind=db_session.bind, class_=AsyncSession, expire_on_commit=False)
+        async with sessions() as one, sessions() as two:
+            with patch.object(api_key_service, "_verify_api_key", verify_together), caplog.at_level(logging.INFO):
+                answered = await asyncio.gather(
+                    api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=one),
+                    api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=two),
+                )
+
+        assert [validation.is_valid for validation in answered] == [True, True]
+        assert caplog.text.count("Rehashed API key") == 1
+
+    async def test_a_rewrite_that_fails_leaves_the_key_as_valid_as_it_was(
+        self, api_key_service, db_session: AsyncSession, legacy_key: dict, monkeypatch, caplog
+    ):
+        """The key is the one the request presented, and its next use tries the rewrite again."""
+
+        def unreachable() -> NoReturn:
+            raise OSError("the database is unreachable")
+
+        monkeypatch.setattr(service_module, "local_session", unreachable)
+
+        with caplog.at_level(logging.ERROR):
+            validation = await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+
+        assert (validation.is_valid, validation.api_key_id) == (True, legacy_key["id"])
+        assert f"Could not rehash API key {legacy_key['id']}" in caplog.text
+        assert (await self._stored_hash(db_session, legacy_key["id"])).startswith("scrypt$")
+
+    async def test_a_revoked_row_is_never_verified(
+        self, api_key_service, db_session: AsyncSession, legacy_key: dict, monkeypatch
+    ):
+        """A revoked key's prefix stays in the listing that showed it, and it is derived against.
+
+        A row no request can authenticate with is never used again either, so it holds its
+        scrypt hash for good: the derivation it costs is one a stranger holding the prefix
+        can ask for as often as they like.
+        """
+        await db_session.execute(update(APIKey).where(APIKey.id == legacy_key["id"]).values(is_active=False))
+        await db_session.commit()
+        stored = await self._stored_hash(db_session, legacy_key["id"])
+        monkeypatch.setattr(hashlib, "scrypt", _no_scrypt)
+
+        validation = await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+
+        assert validation.is_valid is False
+        assert await self._stored_hash(db_session, legacy_key["id"]) == stored
+
+    async def test_an_expired_row_is_never_verified(
+        self, api_key_service, db_session: AsyncSession, legacy_key: dict, monkeypatch
+    ):
+        """An expiry passes on its own, so a key nobody revoked becomes one of those rows."""
+        await db_session.execute(
+            update(APIKey).where(APIKey.id == legacy_key["id"]).values(expires_at=datetime.now(UTC) - timedelta(days=1))
+        )
+        await db_session.commit()
+        stored = await self._stored_hash(db_session, legacy_key["id"])
+        monkeypatch.setattr(hashlib, "scrypt", _no_scrypt)
+
+        validation = await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+
+        assert validation.is_valid is False
+        assert await self._stored_hash(db_session, legacy_key["id"]) == stored
+
+    async def test_it_pays_for_scrypt_once(
+        self, api_key_service, db_session: AsyncSession, legacy_key: dict, monkeypatch, the_rewrite_through_the_test_engine
+    ):
+        """The row holds a digest after the first call, so the second finds it by lookup."""
+        await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+        monkeypatch.setattr(hashlib, "scrypt", _no_scrypt)
+
+        validation = await api_key_service.validate_api_key(api_key=legacy_key["api_key"], db=db_session)
+
+        assert validation.is_valid is True
+
+
+async def test_a_junk_key_sharing_a_migrated_keys_prefix_is_refused_without_scrypt(
+    api_key_service, db_session: AsyncSession, test_api_key, monkeypatch
+):
+    """Prefixes are listed, so a stranger holding one must not be able to make the server derive.
+
+    Only a prefix with a live row still holding a scrypt hash costs a verification, and only
+    until that key is next used.
+    """
+    monkeypatch.setattr(hashlib, "scrypt", _no_scrypt)
+    presented = test_api_key["api_key"][:-4] + "beef"
+
+    validation = await api_key_service.validate_api_key(api_key=presented, db=db_session)
+
+    assert validation.is_valid is False
+    assert validation.error_message == "Invalid API key"
+
+
+@pytest.mark.asyncio
+async def test_keys_created_at_the_same_moment_keep_a_stable_order(api_key_service, db_session: AsyncSession, test_user: dict):
+    """Without an id tie-break, one key can appear on both pages and another on neither."""
+    for name in ("First", "Second", "Third"):
+        await api_key_service.create_api_key(user_id=test_user["id"], key_data=APIKeyCreate(name=name), db=db_session)
+
+    stamped = datetime(2030, 1, 1, tzinfo=UTC)
+    await db_session.execute(update(APIKey).where(APIKey.user_id == test_user["id"]).values(created_at=stamped))
+    await db_session.commit()
+
+    pages = [
+        await api_key_service.get_user_api_keys(user_id=test_user["id"], db=db_session, limit=1, offset=offset)
+        for offset in (0, 1, 2)
+    ]
+    ids = [page["data"][0]["id"] for page in pages]
+
+    assert ids == sorted(ids, reverse=True)
+    assert len(set(ids)) == 3
+
+
+class TestTheStampOnAKey:
+    """``note_use``: the time a request arrived and the address it came from."""
+
+    WRITTEN_LONG_AGO = datetime(2020, 1, 1, tzinfo=UTC)
+
+    async def _stamped(self, db_session: AsyncSession, key_id: int) -> APIKey:
+        stored = await db_session.get_one(APIKey, key_id)
+        await db_session.refresh(stored)
+
+        return stored
+
+    async def test_it_stamps_the_time_the_request_arrived_not_the_time_of_the_write(
+        self, api_key_service, db_session: AsyncSession, test_api_key
+    ):
+        """The write runs after the response, so the two are a request's length apart."""
+        arrived = datetime.now(UTC) - timedelta(minutes=1)
+        await db_session.execute(update(APIKey).where(APIKey.id == test_api_key["id"]).values(updated_at=self.WRITTEN_LONG_AGO))
+        await db_session.commit()
+
+        await api_key_service.note_use(api_key_id=test_api_key["id"], used_from="203.0.113.7", used_at=arrived, db=db_session)
+
+        stamped = await self._stamped(db_session, test_api_key["id"])
+
+        assert stamped.last_used_at == arrived
+        assert stamped.last_used_ip == "203.0.113.7"
+        assert stamped.updated_at is not None and stamped.updated_at > arrived
+
+    async def test_the_write_that_lands_late_leaves_the_later_request_stamped(
+        self, api_key_service, db_session: AsyncSession, test_api_key
+    ):
+        """Each request writes from a session of its own, so the last to land may be the older."""
+        earlier = datetime.now(UTC) - timedelta(minutes=1)
+        later = datetime.now(UTC)
+
+        await api_key_service.note_use(api_key_id=test_api_key["id"], used_from="198.51.100.4", used_at=later, db=db_session)
+        await api_key_service.note_use(api_key_id=test_api_key["id"], used_from="203.0.113.7", used_at=earlier, db=db_session)
+
+        stamped = await self._stamped(db_session, test_api_key["id"])
+
+        assert stamped.last_used_at == later
+        assert stamped.last_used_ip == "198.51.100.4"
+
+    async def test_a_key_that_is_gone_is_stamped_with_nothing(self, api_key_service, db_session: AsyncSession, test_api_key):
+        """A key can be revoked and deleted between the response and this write."""
+        await db_session.execute(delete(APIKey).where(APIKey.id == test_api_key["id"]))
+        await db_session.commit()
+
+        await api_key_service.note_use(
+            api_key_id=test_api_key["id"], used_from="203.0.113.7", used_at=datetime.now(UTC), db=db_session
+        )
+
+        assert await db_session.get(APIKey, test_api_key["id"]) is None

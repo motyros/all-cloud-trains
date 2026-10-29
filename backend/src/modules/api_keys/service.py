@@ -1,0 +1,689 @@
+"""API key management service for developer-facing products."""
+
+import base64
+import binascii
+import hashlib
+import hmac
+import secrets
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
+
+import anyio
+import pydantic
+from fastcrud.types import GetMultiResponseDict
+from sqlalchemy import CursorResult, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...infrastructure.database.session import local_session
+from ...infrastructure.logging import get_logger
+from ..common.exceptions import PermissionDeniedError, ResourceNotFoundError, ValidationError
+from ..user.models import User
+from .crud import crud_api_keys, crud_key_usage
+from .models import APIKey, KeyUsage
+from .retention import retained_days
+from .schemas import (
+    APIKeyCreate,
+    APIKeyCreateInternal,
+    APIKeyRead,
+    APIKeyUpdate,
+    APIKeyValidationResponse,
+    KeyUsageCreate,
+    KeyUsageRead,
+)
+
+logger = get_logger()
+
+SHA256_SCHEME = "sha256"
+SCRYPT_SCHEME = "scrypt"
+
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_DKLEN = 32
+
+
+def _refuse_a_wider_scope(scope: list[str], held: frozenset[str]) -> None:
+    """Raise unless every permission in ``scope`` is one the caller holds.
+
+    Raises:
+        PermissionDeniedError: The scope names a permission the caller doesn't hold.
+    """
+    beyond = sorted(set(scope) - held)
+    if beyond:
+        raise PermissionDeniedError(f"You don't hold: {', '.join(beyond)}")
+
+
+def _extends_expiry(current: datetime | None, proposed: datetime | None) -> bool:
+    """Whether a proposed expiry gives the key more life than it has now."""
+    if current is None:
+        return False
+
+    return proposed is None or proposed > current
+
+
+async def _owner_token_version(user_id: int, db: AsyncSession) -> int:
+    """The account's current credential generation, which a claim, a reset or a change bumps."""
+    stored = await db.execute(select(User.token_version).where(User.id == user_id))
+
+    return stored.scalar_one()
+
+
+class APIKeyService:
+    """Service for managing API keys, their scope, and usage tracking.
+
+    Provides high-level operations for API key lifecycle management,
+    validation, usage tracking, and analytics.
+    """
+
+    def __init__(self):
+        """Initialize API key service."""
+        self.key_prefix_length = 8
+        self.key_length = 48
+
+    def _generate_api_key(self) -> tuple[str, str, str]:
+        """Generate a new API key with prefix and hash.
+
+        Returns:
+            Tuple of (full_key, prefix, hash)
+        """
+        raw_key = secrets.token_urlsafe(self.key_length)
+        prefix = raw_key[: self.key_prefix_length]
+        api_key = f"fai_{prefix}_{raw_key[self.key_prefix_length :]}"
+
+        return api_key, prefix, self._hash_api_key(api_key)
+
+    def _hash_api_key(self, api_key: str) -> str:
+        """Hash an API key for storage.
+
+        Stored format: ``sha256$hexdigest``. A key is 384 bits of randomness from
+        ``secrets.token_urlsafe``, not a password, so it needs no salt and no work
+        factor: the digest is deterministic, which lets a request find its row by a
+        single indexed lookup on ``key_hash``.
+        """
+        digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+        return f"{SHA256_SCHEME}${digest}"
+
+    def _verify_api_key(self, api_key: str, stored_hash: str) -> bool:
+        """Verify a candidate ``api_key`` against a hash an older version stored.
+
+        Only the ``scrypt$N$r$p$salt_b64$derived_b64`` form gets here: a key stored as a
+        digest is found by the lookup instead. Callers run it in a worker thread.
+        """
+        try:
+            scheme, n_str, r_str, p_str, salt_b64, derived_b64 = stored_hash.split("$", 5)
+        except ValueError:
+            return False
+        if scheme != SCRYPT_SCHEME:
+            return False
+        try:
+            n = int(n_str)
+            r = int(r_str)
+            p = int(p_str)
+            salt = base64.b64decode(salt_b64)
+            expected = base64.b64decode(derived_b64)
+        except (ValueError, binascii.Error):
+            return False
+        actual = hashlib.scrypt(
+            api_key.encode("utf-8"),
+            salt=salt,
+            n=n,
+            r=r,
+            p=p,
+            dklen=len(expected),
+        )
+        return hmac.compare_digest(actual, expected)
+
+    async def create_api_key(
+        self,
+        user_id: int,
+        key_data: APIKeyCreate,
+        db: AsyncSession,
+        held: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        """Create a new API key for a user.
+
+        Args:
+            user_id: User ID
+            key_data: API key creation data
+            db: Database session
+            held: The permissions the caller holds; the key's scope may name no other.
+
+        Returns:
+            Created API key with full key (only shown once)
+
+        Raises:
+            PermissionDeniedError: The scope names a permission the caller doesn't hold.
+        """
+        _refuse_a_wider_scope(key_data.permissions, held)
+
+        api_key, prefix, key_hash = self._generate_api_key()
+
+        key_dict = key_data.model_dump()
+        key_dict.update(
+            {
+                "user_id": user_id,
+                "key_hash": key_hash,
+                "key_prefix": prefix,
+                "owner_token_version": await _owner_token_version(user_id, db),
+            }
+        )
+
+        key_internal = APIKeyCreateInternal(**key_dict)
+        created_key = await crud_api_keys.create(db=db, object=key_internal, schema_to_select=APIKeyRead)
+
+        if not created_key:
+            raise ValueError("Failed to create API key")
+
+        logger.info(f"Created API key {created_key['id']} for user {user_id}")
+
+        response_data = created_key.copy()
+        response_data["api_key"] = api_key
+
+        return response_data
+
+    async def get_user_api_keys(
+        self,
+        user_id: int,
+        db: AsyncSession,
+        active_only: bool = True,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> GetMultiResponseDict:
+        """Get all API keys for a user.
+
+        Args:
+            user_id: User ID
+            db: Database session
+            active_only: Whether to return only active keys
+
+        Returns:
+            List of API keys
+        """
+        if active_only:
+            return await crud_api_keys.get_multi(
+                db=db,
+                limit=limit,
+                offset=offset,
+                sort_columns=["created_at", "id"],
+                sort_orders=["desc", "desc"],
+                user_id=user_id,
+                is_active=True,
+                schema_to_select=APIKeyRead,
+            )
+        else:
+            return await crud_api_keys.get_multi(
+                db=db,
+                limit=limit,
+                offset=offset,
+                sort_columns=["created_at", "id"],
+                sort_orders=["desc", "desc"],
+                user_id=user_id,
+                schema_to_select=APIKeyRead,
+            )
+
+    async def get_api_key(
+        self,
+        key_id: int,
+        user_id: int,
+        db: AsyncSession,
+    ) -> dict[str, Any]:
+        """Get a specific API key for a user.
+
+        Args:
+            key_id: API key ID
+            user_id: User ID (for ownership verification)
+            db: Database session
+
+        Returns:
+            API key data
+
+        Raises:
+            ResourceNotFoundError: If key not found
+            PermissionDeniedError: If user doesn't own the key
+        """
+        key = await crud_api_keys.get(db=db, id=key_id, schema_to_select=APIKeyRead)
+
+        if not key:
+            raise ResourceNotFoundError("API key not found")
+
+        if key["user_id"] != user_id:
+            raise PermissionDeniedError("Access denied to this API key")
+
+        return key
+
+    async def update_api_key(
+        self,
+        key_id: int,
+        user_id: int,
+        update_data: APIKeyUpdate,
+        db: AsyncSession,
+        held: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        """Update an API key.
+
+        Args:
+            key_id: API key ID
+            user_id: User ID (for ownership verification)
+            update_data: Update data
+            db: Database session
+            held: The permissions the caller holds; a new scope may name no other.
+
+        Returns:
+            Updated API key data
+
+        Raises:
+            PermissionDeniedError: A new scope names a permission the caller doesn't hold.
+        """
+        if update_data.permissions is not None:
+            _refuse_a_wider_scope(update_data.permissions, held)
+
+        existing = await self.get_api_key(key_id=key_id, user_id=user_id, db=db)
+
+        update_dict = update_data.model_dump(exclude_unset=True)
+
+        if update_dict.get("is_active") and not existing["is_active"]:
+            raise ValidationError("A revoked key cannot be reactivated. Create a new key instead.")
+
+        if "expires_at" in update_dict and _extends_expiry(existing["expires_at"], update_dict["expires_at"]):
+            raise ValidationError("An API key's expiry can be brought forward, never pushed back.")
+        updated_key = await crud_api_keys.update(
+            db=db,
+            object=update_dict,
+            id=key_id,
+            return_columns=list(APIKeyRead.model_fields.keys()),
+        )
+
+        logger.info(f"Updated API key {key_id} for user {user_id}")
+
+        if updated_key is None:
+            updated_key = await crud_api_keys.get(db=db, id=key_id, schema_to_select=APIKeyRead)
+
+        if updated_key is None:
+            raise ResourceNotFoundError("API key not found after update")
+
+        return updated_key
+
+    async def delete_api_key(
+        self,
+        key_id: int,
+        user_id: int,
+        db: AsyncSession,
+    ) -> None:
+        """Delete (deactivate) an API key.
+
+        Args:
+            key_id: API key ID
+            user_id: User ID (for ownership verification)
+            db: Database session
+        """
+        await self.get_api_key(key_id=key_id, user_id=user_id, db=db)
+
+        await crud_api_keys.update(
+            db=db,
+            object={"is_active": False},
+            id=key_id,
+        )
+
+        logger.info(f"Deactivated API key {key_id} for user {user_id}")
+
+    async def validate_api_key(
+        self,
+        api_key: str,
+        db: AsyncSession,
+    ) -> APIKeyValidationResponse:
+        """Match an API key to a live key row, and report its owner and its scope.
+
+        Nothing of the request's own session is committed here: when the key was last used
+        is stamped by the usage recorder, after the response, and a row an older version
+        stored as scrypt is moved over through a session of its own.
+
+        A row the read schema refuses, such as a scope an older version stored as an
+        object, is reported as invalid and logged.
+
+        Args:
+            api_key: API key to validate
+            db: Database session
+
+        Returns:
+            Validation response with key details and the permission names it carries
+        """
+        prefix_start = len("fai_")
+        prefix_end = prefix_start + self.key_prefix_length
+        if not api_key.startswith("fai_") or len(api_key) <= prefix_end or api_key[prefix_end] != "_":
+            return APIKeyValidationResponse(
+                is_valid=False,
+                error_message="Invalid API key",
+            )
+        prefix = api_key[prefix_start:prefix_end]
+
+        matched = await self._row_for(api_key, prefix, db)
+        if matched is None:
+            return APIKeyValidationResponse(
+                is_valid=False,
+                error_message="Invalid API key",
+            )
+
+        try:
+            key = APIKeyRead.model_validate(matched).model_dump()
+        except pydantic.ValidationError:
+            logger.warning(f"API key {matched.id} holds a column no schema can read; run scripts/cleanup_api_key_json.py")
+
+            return APIKeyValidationResponse(
+                is_valid=False,
+                error_message="Invalid API key",
+            )
+
+        if not key["is_active"]:
+            return APIKeyValidationResponse(
+                is_valid=False,
+                error_message="API key is inactive",
+            )
+
+        if key["expires_at"] and key["expires_at"] < datetime.now(UTC):
+            return APIKeyValidationResponse(
+                is_valid=False,
+                error_message="API key has expired",
+            )
+
+        return APIKeyValidationResponse(
+            is_valid=True,
+            api_key_id=key["id"],
+            user_id=key["user_id"],
+            owner_token_version=key["owner_token_version"],
+            permissions=key["permissions"],
+            usage_limits=key["usage_limits"],
+        )
+
+    async def _row_for(self, api_key: str, prefix: str, db: AsyncSession) -> APIKey | None:
+        """The key row ``api_key`` belongs to, or ``None``.
+
+        A digest finds its row through the unique index on ``key_hash``. A row an older
+        version stored as scrypt is found by prefix and verified, then rewritten as a
+        digest, so a key of that kind pays for a derivation on its next use and none
+        after. A key matching no digest pays one for every live scrypt row under the
+        prefix it carries, each time it is presented, and
+        ``scripts/revoke_scrypt_api_keys.py`` names those rows.
+        """
+        stored = await db.execute(
+            select(APIKey).where(APIKey.key_hash == self._hash_api_key(api_key)).execution_options(populate_existing=True)
+        )
+        matched = stored.scalar_one_or_none()
+        if matched is not None:
+            return matched
+
+        return await self._rehashed(api_key, prefix, db)
+
+    async def _rehashed(self, api_key: str, prefix: str, db: AsyncSession) -> APIKey | None:
+        """The key row holding a scrypt hash of ``api_key``, with its digest written as well.
+
+        The row is read through ``db`` and rewritten through a session of its own, so the
+        session the request authenticates through is one this path only reads.
+
+        Only a row a request could be authenticated by is derived against. A revoked or
+        expired row is refused either way, and is never used again to move itself over, so
+        it would hold its scrypt hash for good: anybody holding the prefix a listing showed
+        them could ask the server for that derivation as often as they liked.
+        """
+        legacy = await db.execute(
+            select(APIKey)
+            .where(
+                APIKey.key_prefix == prefix,
+                APIKey.key_hash.startswith(f"{SCRYPT_SCHEME}$"),
+                APIKey.is_active,
+                or_(APIKey.expires_at.is_(None), APIKey.expires_at > datetime.now(UTC)),
+            )
+            .execution_options(populate_existing=True)
+        )
+        for candidate in legacy.scalars().all():
+            if await anyio.to_thread.run_sync(self._verify_api_key, api_key, candidate.key_hash):
+                await self._write_the_digest(candidate.id, candidate.key_hash, self._hash_api_key(api_key))
+
+                return candidate
+
+        return None
+
+    async def _write_the_digest(self, api_key_id: int, verified: str, digest: str) -> None:
+        """Rewrite the scrypt hash a key's row holds as ``digest``, in a session of its own.
+
+        A request authenticates through a session its route writes through, so committing
+        that one here would end a transaction the route never finished and carry whatever
+        it had written with it. This write is its own, and a route that rolls back or fails
+        afterwards leaves it done.
+
+        The row is rewritten only while it still holds the hash that was verified, so of
+        two requests racing with one key exactly one row moves over. A write that fails
+        leaves the key as valid as it was, and the next request it carries tries again.
+        """
+        try:
+            async with local_session() as writing:
+                moved = await writing.execute(
+                    update(APIKey).where(APIKey.id == api_key_id, APIKey.key_hash == verified).values(key_hash=digest)
+                )
+                await writing.commit()
+        except Exception:
+            logger.exception(f"Could not rehash API key {api_key_id} from scrypt to sha256")
+
+            return
+
+        if cast("CursorResult[Any]", moved).rowcount == 1:
+            logger.info(f"Rehashed API key {api_key_id} from scrypt to sha256")
+
+    async def note_use(self, api_key_id: int, used_from: str | None, used_at: datetime, db: AsyncSession) -> None:
+        """Stamp a key with the time a request arrived and the address it came from.
+
+        ``used_at`` is that time, not the moment this write lands, and a key already
+        stamped later than it keeps the stamp it has. So of two requests whose writes land
+        out of order, the later request is the one the key names, time and address
+        together, and a key that is gone is stamped with nothing.
+        """
+        await db.execute(
+            update(APIKey)
+            .where(APIKey.id == api_key_id, or_(APIKey.last_used_at.is_(None), APIKey.last_used_at < used_at))
+            .values(last_used_at=used_at, last_used_ip=used_from, updated_at=datetime.now(UTC))
+        )
+        await db.commit()
+
+    async def record_usage(
+        self,
+        api_key_id: int,
+        user_id: int,
+        usage_data: KeyUsageCreate,
+        db: AsyncSession,
+    ) -> dict[str, Any]:
+        """Record API key usage for analytics and billing.
+
+        Args:
+            api_key_id: API key ID
+            user_id: User ID
+            usage_data: Usage data
+            db: Database session
+
+        Returns:
+            Created usage record
+        """
+        if usage_data.api_key_id != api_key_id or usage_data.user_id != user_id:
+            usage_dict = usage_data.model_dump()
+            usage_dict.update(
+                {
+                    "api_key_id": api_key_id,
+                    "user_id": user_id,
+                }
+            )
+            usage_data = KeyUsageCreate(**usage_dict)
+
+        usage_record = await crud_key_usage.create(db=db, object=usage_data, schema_to_select=KeyUsageRead)
+
+        if not usage_record:
+            raise ValueError("Failed to create usage record")
+
+        return usage_record
+
+    async def get_key_usage(
+        self,
+        key_id: int,
+        user_id: int,
+        db: AsyncSession,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> GetMultiResponseDict:
+        """Get usage history for an API key.
+
+        Args:
+            key_id: API key ID
+            user_id: User ID (for ownership verification)
+            db: Database session
+            limit: Maximum number of records
+            offset: Number of records to skip
+
+        Returns:
+            List of usage records
+        """
+        await self.get_api_key(key_id=key_id, user_id=user_id, db=db)
+
+        return await crud_key_usage.get_multi(
+            db=db,
+            limit=limit,
+            offset=offset,
+            sort_columns=["created_at", "id"],
+            sort_orders=["desc", "desc"],
+            api_key_id=key_id,
+            schema_to_select=KeyUsageRead,
+        )
+
+    async def get_usage_analytics(
+        self,
+        key_id: int,
+        user_id: int,
+        db: AsyncSession,
+        days: int = 30,
+    ) -> dict[str, Any]:
+        """Get usage analytics for an API key.
+
+        Args:
+            key_id: API key ID
+            user_id: User ID (for ownership verification)
+            db: Database session
+            days: Number of days to analyze, read down to the days still retained
+
+        Returns:
+            Usage analytics
+        """
+        await self.get_api_key(key_id=key_id, user_id=user_id, db=db)
+
+        since_date = datetime.now(UTC) - timedelta(days=min(days, retained_days()))
+
+        in_window = (KeyUsage.api_key_id == key_id, KeyUsage.created_at >= since_date)
+        successful = func.count().filter(KeyUsage.status_code.between(200, 299))
+        tokens = func.coalesce(func.sum(KeyUsage.tokens_used), 0)
+        cost = func.coalesce(func.sum(KeyUsage.cost_microcents), 0)
+
+        totals = (
+            await db.execute(
+                select(func.count(), successful, tokens, cost, func.avg(KeyUsage.response_time_ms)).where(*in_window)
+            )
+        ).one()
+        total_requests, successful_requests, total_tokens, total_cost, avg_response_time = totals
+
+        endpoint_count = func.count().label("count")
+        endpoint_rows = await db.execute(
+            select(KeyUsage.endpoint, endpoint_count)
+            .where(*in_window)
+            .group_by(KeyUsage.endpoint)
+            .order_by(endpoint_count.desc(), KeyUsage.endpoint)
+            .limit(10)
+        )
+
+        error_rows = await db.execute(
+            select(KeyUsage.status_code, func.count())
+            .where(*in_window, KeyUsage.status_code >= 400)
+            .group_by(KeyUsage.status_code)
+            .order_by(KeyUsage.status_code)
+        )
+
+        day = func.date(func.timezone("UTC", KeyUsage.created_at)).label("day")
+        daily_rows = await db.execute(
+            select(day, func.count(), successful, tokens, cost).where(*in_window).group_by(day).order_by(day)
+        )
+
+        return {
+            "api_key_id": key_id,
+            "total_requests": total_requests,
+            "successful_requests": successful_requests,
+            "failed_requests": total_requests - successful_requests,
+            "total_tokens": int(total_tokens),
+            "total_cost_microcents": int(total_cost),
+            "average_response_time_ms": float(avg_response_time) if avg_response_time is not None else None,
+            "most_used_endpoints": [{"endpoint": endpoint, "count": count} for endpoint, count in endpoint_rows],
+            "error_breakdown": {str(status_code): count for status_code, count in error_rows},
+            "usage_by_day": [
+                {
+                    "date": row_day.isoformat(),
+                    "requests": requests,
+                    "successful_requests": day_successful,
+                    "failed_requests": requests - day_successful,
+                    "tokens": int(day_tokens),
+                    "cost_microcents": int(day_cost),
+                }
+                for row_day, requests, day_successful, day_tokens, day_cost in daily_rows
+            ],
+        }
+
+    async def get_user_summary(
+        self,
+        user_id: int,
+        db: AsyncSession,
+    ) -> dict[str, Any]:
+        """Get comprehensive API key summary for a user.
+
+        Args:
+            user_id: User ID
+            db: Database session
+
+        Returns:
+            User API key summary
+        """
+        keys_result = await self.get_user_api_keys(user_id=user_id, db=db, active_only=False)
+        keys_data = keys_result.get("data", []) if isinstance(keys_result, dict) else []
+
+        total_requests_result = await crud_key_usage.count(db=db, user_id=user_id)
+        total_requests = total_requests_result if isinstance(total_requests_result, int) else 0
+
+        total_cost = await self.sum_user_usage_cost(user_id=user_id, db=db)
+        total_keys, active_keys = await self.count_user_api_keys(user_id=user_id, db=db)
+
+        return {
+            "user_id": user_id,
+            "total_keys": total_keys,
+            "active_keys": active_keys,
+            "total_requests": total_requests,
+            "total_cost_microcents": total_cost,
+            "keys": keys_data,
+        }
+
+    async def sum_user_usage_cost(self, user_id: int, db: AsyncSession) -> int:
+        """Total ``cost_microcents`` across every key-usage record of a user.
+
+        Args:
+            user_id: User ID
+            db: Database session
+
+        Returns:
+            The summed cost, ``0`` when the user has no usage.
+        """
+        stmt = select(func.coalesce(func.sum(KeyUsage.cost_microcents), 0)).where(KeyUsage.user_id == user_id)
+        return int((await db.execute(stmt)).scalar_one() or 0)
+
+    async def count_user_api_keys(self, user_id: int, db: AsyncSession) -> tuple[int, int]:
+        """Count a user's API keys, in total and active only.
+
+        Args:
+            user_id: User ID
+            db: Database session
+
+        Returns:
+            ``(total_keys, active_keys)``.
+        """
+        stmt = select(func.count(), func.count().filter(APIKey.is_active)).where(APIKey.user_id == user_id)
+        total, active = (await db.execute(stmt)).one()
+        return int(total), int(active)

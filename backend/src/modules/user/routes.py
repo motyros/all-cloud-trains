@@ -1,0 +1,347 @@
+from typing import Any
+
+from fastapi import APIRouter, BackgroundTasks
+from fastcrud import PaginatedListResponse, compute_offset, paginated_response
+
+from ...infrastructure.auth.authorization import load_permissions, require_permissions
+from ...infrastructure.auth.deps import (
+    CurrentPermissionsDep,
+    CurrentPrincipalDep,
+    CurrentSuperUserDep,
+    CurrentUserDep,
+    FreshSessionPrincipalDep,
+)
+from ...infrastructure.auth.scope import carries_a_scope
+from ...infrastructure.dependencies import AsyncSessionDep
+from ..common.pagination import ItemsPerPageDep, PageDep
+from .dependencies import UserServiceDep
+from .exceptions import EmailAlreadyRegisteredError
+from .schemas import (
+    UserCreate,
+    UserProfileRead,
+    UserRead,
+    UserUpdate,
+)
+
+router = APIRouter(tags=["Users"])
+
+SIGNUP_ACCEPTED = "If the address is available, the account has been created."
+"""What a signup answers, whether the address was free or already had an account."""
+
+
+@router.post(
+    "/",
+    status_code=201,
+    summary="Create New User Account",
+    description="""
+           Creates a new user account in the system.
+
+           This endpoint allows registration of new users with their basic information:
+           - Full name
+           - Username (must be lowercase alphanumeric)
+           - Email address
+           - Password (with security requirements)
+
+           New accounts are automatically assigned to the default tier.
+
+           The answer says nothing about whether the address was free. An address that
+           already has an account is answered the same way as one that did not, and the
+           account that holds it is told somebody tried to sign up with it, so a caller
+           cannot use this route to find out who is registered. A username that is taken
+           answers `409`: a username is public, and a signup form has to be able to say
+           so.
+
+           The created profile is not returned, for the same reason. Read it from
+           `GET /api/v1/users/{username}` once signed in.
+           """,
+    responses={
+        201: {"description": "The signup was accepted, whether or not the address was free"},
+        400: {"description": "Invalid user data"},
+        409: {"description": "Username already exists"},
+    },
+    response_description="A fixed confirmation, the same for every accepted signup",
+)
+async def create_user(
+    user: UserCreate,
+    db: AsyncSessionDep,
+    user_service: UserServiceDep,
+    background: BackgroundTasks,
+) -> dict[str, str]:
+    """Create a new user account, answering the same way whether its address was free.
+
+    The notice to an existing owner is left to run after the answer: waiting for a mail
+    server on that path alone would tell a caller which addresses hold accounts by the
+    clock, since the other path waits for nothing.
+    """
+    try:
+        await user_service.create(user, db)
+    except EmailAlreadyRegisteredError:
+        background.add_task(user_service.notify_the_address_owner, user.email)
+
+    return {"message": SIGNUP_ACCEPTED}
+
+
+@router.get(
+    "/",
+    response_model=PaginatedListResponse[UserRead],
+    summary="List All Users",
+    description="""
+           Retrieves a paginated list of all users in the system.
+
+           Requires the `user.read` permission, which a role grants; superusers
+           always pass. The results include basic profile information for each
+           user.
+
+           For security reasons, sensitive information like passwords is never included
+           in the response.
+           """,
+    responses={
+        401: {"description": "Not authenticated"},
+        403: {"description": "Not authorized - requires the user.read permission"},
+    },
+    response_description="A paginated list of users with total count and pagination metadata",
+    dependencies=[require_permissions("user.read")],
+)
+async def get_users(
+    db: AsyncSessionDep,
+    user_service: UserServiceDep,
+    page: PageDep = 1,
+    items_per_page: ItemsPerPageDep = 10,
+) -> dict[str, Any]:
+    """Get paginated list of users."""
+    users_data = await user_service.get_paginated(skip=compute_offset(page, items_per_page), limit=items_per_page, db=db)
+
+    return paginated_response(crud_data=users_data, page=page, items_per_page=items_per_page)
+
+
+@router.get(
+    "/me",
+    response_model=UserRead,
+    summary="Get Current User Profile",
+    description="""
+            Retrieves the profile information of the currently authenticated user.
+
+            This endpoint provides users with their own profile data including:
+            - Basic profile information (name, username, email)
+            - Profile image URL
+            - Subscription tier information
+            - Authentication details (superuser status, email verification)
+
+            This is a convenient way for frontend applications to get the current
+            user's information for display or personalization purposes.
+            """,
+    responses={401: {"description": "Not authenticated"}},
+    response_description="The current user's profile data",
+)
+async def get_current_user_profile(
+    current_user: CurrentUserDep,
+) -> dict[str, Any]:
+    """Get current authenticated user's profile."""
+    return current_user
+
+
+@router.get(
+    "/{username}",
+    response_model=UserProfileRead,
+    summary="Get User Profile by Username",
+    description="""
+            Retrieves a user's public profile by their unique username.
+
+            Any signed-in user can look up any other active user. The response carries
+            the display fields only - no email address - so the lookup can't be used to
+            collect addresses. Read your own full record from `/users/me`.
+
+            Note that usernames are case-sensitive in lookup operations.
+            """,
+    responses={401: {"description": "Not authenticated"}, 404: {"description": "User not found"}},
+    response_description="The requested user's profile data",
+)
+async def get_user_by_username(
+    username: str,
+    _: CurrentUserDep,
+    db: AsyncSessionDep,
+    user_service: UserServiceDep,
+) -> dict[str, Any]:
+    """Get user profile by username."""
+    user = await user_service.get_by_username(username, db)
+    return user
+
+
+@router.get(
+    "/active-and-inactive/{username}",
+    response_model=UserRead,
+    summary="Get Active and Inactive User Profile by Username(Admin)",
+    description="""
+            Retrieve a user's profile information by their unique username.
+
+            This endpoint can be used to look up any user in the system by their
+            username. It returns the same profile data structure as other user
+            endpoints but does not include sensitive information.
+
+            Note that usernames are case-sensitive in lookup operations.
+            """,
+    responses={
+        401: {"description": "Not authenticated"},
+        403: {"description": "Not authorized - requires admin privileges"},
+        404: {"description": "User not found"},
+    },
+    response_description="the requested user's profile data",
+)
+async def get_active_and_inactive_user_by_username(
+    username: str,
+    db: AsyncSessionDep,
+    _: CurrentSuperUserDep,
+    user_service: UserServiceDep,
+) -> dict[str, Any]:
+    """Get active and inactive profile by username."""
+    return await user_service.get_active_and_inactive_by_username(username, db)
+
+
+@router.patch(
+    "/{username}",
+    summary="Update User Profile",
+    description="""
+            Updates a user's profile information.
+
+            This endpoint allows users to modify their own profile data, and users
+            holding the `user.update` permission to modify another user's data. Only
+            the fields provided in the request will be updated, and all fields are
+            optional.
+
+            Permission rules:
+            - Regular users can only update their own profiles
+            - Superusers can update any user's profile
+            - A credential that carries a scope, an API key among them, needs
+              `user.update` even for its owner's own profile
+            - A `user.update` holder can update another user only when that user is
+              not a superuser and holds no permission the requester lacks
+            - Note: Tier updates are handled by a separate endpoint (/users/{username}/tier)
+
+            The email address is not updatable here: an account moves its own address
+            through `POST /api/v1/auth/email/change-request`, which emails the new
+            address a confirmation link and tells the old one once it is used.
+
+            Username changes are validated to ensure uniqueness.
+            """,
+    responses={
+        200: {"description": "Profile updated successfully"},
+        400: {"description": "Invalid profile data"},
+        403: {"description": "Not authorized to update this profile"},
+        404: {"description": "User not found"},
+        409: {"description": "Username already exists"},
+    },
+    response_description="Success confirmation message",
+)
+async def update_user_profile(
+    username: str,
+    values: UserUpdate,
+    current_user: CurrentUserDep,
+    principal: CurrentPrincipalDep,
+    permissions: CurrentPermissionsDep,
+    db: AsyncSessionDep,
+    user_service: UserServiceDep,
+) -> dict[str, str]:
+    """Update user profile information."""
+    acting_as_superuser = principal.is_superuser
+    await user_service.verify_update_permission(
+        current_user, username, permissions, is_superuser=acting_as_superuser, scoped=carries_a_scope(principal)
+    )
+    user = await user_service.get_by_username(username, db)
+
+    if not user_service.is_self_or_superuser(current_user, user["username"], is_superuser=acting_as_superuser):
+        target_permissions = await load_permissions(db, user["id"])
+        user_service.verify_no_privilege_escalation(user, values, permissions, target_permissions)
+
+    await user_service.update(user["id"], values, db)
+    return {"message": "User updated successfully"}
+
+
+@router.delete(
+    "/{username}",
+    summary="Deactivate User Account",
+    description="""
+            Soft-deletes (deactivates) a user account.
+
+            This endpoint performs a logical deletion of a user account, marking it
+            as deactivated in the system rather than permanently removing it. This allows
+            for potential reactivation in the future.
+
+            Permission rules:
+            - Regular users can only deactivate their own accounts
+            - Administrators can deactivate any user's account
+            - The caller must be signed in to a session; an API key cannot close an account
+            - With `FRESH_SIGN_IN_SECONDS` set, the sign-in must be no older than that
+
+            Deactivated accounts cannot be used for login and are typically hidden
+            from regular user listings.
+            """,
+    responses={
+        200: {"description": "Account deactivated successfully"},
+        401: {"description": "Not signed in to a session"},
+        403: {"description": "Not authorized to deactivate this account, or signed in too long ago"},
+        404: {"description": "User not found"},
+    },
+    response_description="Success confirmation message",
+)
+async def delete_user_account(
+    username: str,
+    current_user: CurrentUserDep,
+    db: AsyncSessionDep,
+    user_service: UserServiceDep,
+    principal: FreshSessionPrincipalDep,
+) -> dict[str, str]:
+    """Soft delete a user account, for a caller signed in to a session recently enough."""
+    await user_service.verify_user_permission(
+        current_user, username, "delete this account", is_superuser=principal.is_superuser
+    )
+    user = await user_service.get_by_username(username, db)
+
+    await user_service.delete(user["id"], db)
+    return {"message": "User account deactivated"}
+
+
+@router.delete(
+    "/db/{username}",
+    summary="GDPR Delete User (Admin)",
+    description="""
+            GDPR/LGPD compliant user deletion with data anonymization.
+
+            This admin-only endpoint anonymizes user PII while preserving business data
+            integrity and maintaining referential relationships for conversations and
+            analytics data.
+
+            This operation:
+            - Removes personally identifiable information (PII)
+            - Retains email for legal compliance purposes
+            - Prevents future login by clearing credentials
+            - Maintains foreign key relationships (conversations, logs)
+            - Logs the deletion event with legal basis for audit compliance
+
+            Unlike hard deletion, this approach:
+            - Complies with GDPR Article 17 (Right to Erasure)
+            - Preserves business analytics data
+            - Eliminates foreign key constraint violations
+            - Maintains audit trails for legal requirements
+
+            This operation is needed for:
+            - GDPR/LGPD data deletion requests
+            - Legal compliance while preserving business data
+            - Safe user removal without breaking referential integrity
+            """,
+    responses={
+        200: {"description": "User anonymized successfully"},
+        403: {"description": "Not authorized - requires admin privileges"},
+        404: {"description": "User not found"},
+    },
+    response_description="Success confirmation message",
+)
+async def gdpr_delete_user(
+    username: str,
+    db: AsyncSessionDep,
+    user_service: UserServiceDep,
+    _: CurrentSuperUserDep,
+) -> dict[str, str]:
+    """GDPR compliant user anonymization (admin only)."""
+    user = await user_service.get_active_and_inactive_by_username(username, db)
+    await user_service.anonymize_user(user["id"], db)
+    return {"message": "User data anonymized in compliance with GDPR"}
